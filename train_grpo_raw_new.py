@@ -56,18 +56,18 @@ class TrainConfig:
     )
 
     # GRPO
-    num_generations: int = 4   # G completions sampled per prompt
-    beta: float = 0.001        # KL-penalty coefficient
+    num_generations: int = 2       # ↓ was 4; cuts generation memory in half
+    beta: float = 0.001            # KL-penalty coefficient
 
     # Training loop
     num_epochs: int = 3
     lr: float = 1e-5
     warmup_ratio: float = 0.1
-    grad_accum_steps: int = 4  # effective mini-batch = this many prompts
+    grad_accum_steps: int = 4
     max_grad_norm: float = 1.0
 
     # Generation
-    max_new_tokens: int = 64
+    max_new_tokens: int = 64       # ↓ was 128
     temperature: float = 0.9
     top_p: float = 0.9
 
@@ -77,6 +77,18 @@ class TrainConfig:
     save_steps: int = 50
     seed: int = 42
     data_dir: str = "./data"
+
+    # Memory
+    offload_ref_to_cpu: bool = True   # keep ref model on CPU, move per-call
+    gradient_checkpointing: bool = True
+
+
+# ─── Memory helpers ───────────────────────────────────────────────────────────────
+
+def mem_stats(device: torch.device) -> str:
+    alloc   = torch.cuda.memory_allocated(device)  / 1024**3
+    reserved = torch.cuda.memory_reserved(device)  / 1024**3
+    return f"GPU mem: {alloc:.1f}/{reserved:.1f} GB (alloc/reserved)"
 
 
 # ─── Data helpers ─────────────────────────────────────────────────────────────────
@@ -98,7 +110,7 @@ def _extract_images(messages: list) -> list[Image.Image]:
             if part.get("type") != "image":
                 continue
             img = part["image"]
-            if isinstance(img, str):          # path on disk
+            if isinstance(img, str):
                 img = Image.open(img).convert("RGB")
             images.append(img)
     return images
@@ -109,10 +121,6 @@ def build_prompt_inputs(
     processor: AutoProcessor,
     device: torch.device,
 ) -> dict[str, torch.Tensor]:
-    """
-    Convert a list-of-message-dicts (system + user with image) into a dict of
-    tensors ready for Qwen2.5-VL — with the generation prompt appended.
-    """
     images = _extract_images(messages)
     text = processor.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
@@ -132,39 +140,37 @@ def compute_seq_log_prob(
     model: torch.nn.Module,
     prompt_inputs: dict[str, torch.Tensor],
     completion_ids: torch.Tensor,   # shape (1, T)
+    target_device: torch.device,
 ) -> torch.Tensor:
     """
     Return  Σ_t  log π(token_t | context)  summed over the T completion tokens.
-
-    Runs one forward pass on the concatenated [prompt || completion] sequence.
-    Gradients flow when the model is in train mode; wrap in torch.no_grad()
-    externally when scoring the reference model.
-
-    Index arithmetic
-    ----------------
-    logits[:, j, :]  =  distribution over token at position j+1.
-    Completion tokens live at positions  [L, L+T-1]  (0-indexed).
-    Their predicting logits are at       [L-1, L+T-2].
-    → comp_logits = logits[:, L-1 : L+T-1, :]
+    prompt_inputs and completion_ids are moved to whatever device `model` is on,
+    then the result is returned on target_device.
     """
-    L = prompt_inputs["input_ids"].shape[1]   # prompt length
-    T = completion_ids.shape[1]               # completion length
+    # Infer model device from first parameter
+    model_device = next(model.parameters()).device
 
-    full_ids  = torch.cat([prompt_inputs["input_ids"],  completion_ids],          dim=1)
-    full_mask = torch.cat([prompt_inputs["attention_mask"], torch.ones_like(completion_ids)], dim=1)
+    # Move inputs to model's device
+    p_inputs = {k: v.to(model_device) for k, v in prompt_inputs.items()}
+    comp     = completion_ids.to(model_device)
+
+    L = p_inputs["input_ids"].shape[1]
+    T = comp.shape[1]
+
+    full_ids  = torch.cat([p_inputs["input_ids"],  comp], dim=1)
+    full_mask = torch.cat([p_inputs["attention_mask"], torch.ones_like(comp)], dim=1)
 
     kwargs: dict = {"input_ids": full_ids, "attention_mask": full_mask}
-    if "pixel_values"   in prompt_inputs:
-        kwargs["pixel_values"]   = prompt_inputs["pixel_values"]
-    if "image_grid_thw" in prompt_inputs:
-        kwargs["image_grid_thw"] = prompt_inputs["image_grid_thw"]
+    if "pixel_values"   in p_inputs:
+        kwargs["pixel_values"]   = p_inputs["pixel_values"]
+    if "image_grid_thw" in p_inputs:
+        kwargs["image_grid_thw"] = p_inputs["image_grid_thw"]
 
-    outputs = model(**kwargs)                              # logits: (1, L+T, V)
-    comp_logits = outputs.logits[:, L - 1 : L + T - 1, :]  # (1, T, V)
-
-    log_probs   = F.log_softmax(comp_logits, dim=-1)       # (1, T, V)
-    token_lp    = log_probs.gather(2, completion_ids.unsqueeze(-1)).squeeze(-1)  # (1, T)
-    return token_lp.sum(dim=-1)                            # (1,)
+    outputs     = model(**kwargs)
+    comp_logits = outputs.logits[:, L - 1 : L + T - 1, :]
+    log_probs   = F.log_softmax(comp_logits, dim=-1)
+    token_lp    = log_probs.gather(2, comp.unsqueeze(-1)).squeeze(-1)
+    return token_lp.sum(dim=-1).to(target_device)
 
 
 # ─── GRPO step ────────────────────────────────────────────────────────────────────
@@ -178,23 +184,11 @@ def grpo_step(
     cfg: TrainConfig,
     device: torch.device,
 ) -> tuple[torch.Tensor, dict]:
-    """
-    One GRPO optimisation step for a single prompt.
-
-    Algorithm
-    ---------
-    1. Sample G completions from the current policy (no grad).
-    2. Score each completion with the BioBERT reward function.
-    3. Normalise rewards within the group → advantages  A_i = (r_i - μ) / σ.
-    4. Compute loss:
-         L = -mean_i( A_i · log π_θ(y_i | x) )
-             + β · mean_i( log π_θ(y_i | x) - log π_ref(y_i | x) )
-    """
     G      = cfg.num_generations
     pad_id = processor.tokenizer.pad_token_id
     eos_id = processor.tokenizer.eos_token_id
 
-    # ── 1. Generate G completions ─────────────────────────────────────────────
+    # ── 1. Generate G completions (no grad) ──────────────────────────────────
     policy.eval()
     comp_ids_list:  list[torch.Tensor] = []
     comp_text_list: list[str]          = []
@@ -210,38 +204,40 @@ def grpo_step(
                 pad_token_id=pad_id,
                 eos_token_id=eos_id,
             )
-            # Strip the prompt prefix; keep only new tokens
-            comp = gen_ids[:, prompt_inputs["input_ids"].shape[1] :]   # (1, T_i)
+            comp = gen_ids[:, prompt_inputs["input_ids"].shape[1]:].cpu()  # store on CPU
             comp_ids_list.append(comp)
             comp_text_list.append(
                 processor.tokenizer.decode(comp[0], skip_special_tokens=True)
             )
+            del gen_ids
+            torch.cuda.empty_cache()
 
     policy.train()
 
     # ── 2. Rewards ────────────────────────────────────────────────────────────
     rewards = biobert_reward_fn(comp_text_list, ground_truth=[ground_truth] * G)
-    R = torch.tensor(rewards, dtype=torch.float32, device=device)  # (G,)
-
-    # ── 3. Group-relative advantages ─────────────────────────────────────────
+    R   = torch.tensor(rewards, dtype=torch.float32, device=device)
     mean_R = R.mean()
     std_R  = R.std().clamp(min=1e-8)
-    adv    = (R - mean_R) / std_R   # (G,)
+    adv    = (R - mean_R) / std_R
 
-    # ── 4. Policy-gradient + KL loss ─────────────────────────────────────────
+    # ── 3. Policy-gradient + KL loss (one completion at a time) ───────────────
     pg_terms: list[torch.Tensor] = []
     kl_terms: list[torch.Tensor] = []
 
     for i in range(G):
-        comp = comp_ids_list[i]
+        comp = comp_ids_list[i].to(device)   # move to GPU just for this pass
 
-        log_pi = compute_seq_log_prob(policy, prompt_inputs, comp)          # grad on
+        log_pi = compute_seq_log_prob(policy, prompt_inputs, comp, device)
 
         with torch.no_grad():
-            log_pi_ref = compute_seq_log_prob(ref, prompt_inputs, comp)     # no grad
+            log_pi_ref = compute_seq_log_prob(ref, prompt_inputs, comp, device)
 
         pg_terms.append(-adv[i] * log_pi.squeeze())
         kl_terms.append((log_pi - log_pi_ref).squeeze())
+
+        del comp
+        torch.cuda.empty_cache()
 
     pg_loss = torch.stack(pg_terms).mean()
     kl_loss = torch.stack(kl_terms).mean()
@@ -266,52 +262,66 @@ def train(cfg: TrainConfig) -> None:
     dtype  = torch.bfloat16 if cfg.bf16 and device.type == "cuda" else torch.float32
     print(f"Device: {device}  |  dtype: {dtype}")
 
-    # ── Load model and processor ──────────────────────────────────────────────
+    torch.cuda.reset_peak_memory_stats(device)
+
+    # ── Load policy model ─────────────────────────────────────────────────────
     print(f"\nLoading {cfg.model_name} ...")
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-    cfg.model_name,
-    torch_dtype=dtype,
-)
+        cfg.model_name,
+        torch_dtype=dtype,
+    )
     model.to(device)
+
+    if cfg.gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+        print("Gradient checkpointing enabled.")
+
     processor = AutoProcessor.from_pretrained(cfg.model_name)
     processor.tokenizer.padding_side = "left"
     if processor.tokenizer.pad_token is None:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
-    # ── Reference model: frozen deep copy of base (no LoRA) ──────────────────
-    # Created BEFORE LoRA injection so it is the true base model.
+    # ── Reference model ───────────────────────────────────────────────────────
     print("Creating frozen reference model ...")
     ref_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-    cfg.model_name,
-    torch_dtype=dtype,
-)
-    ref_model.to(device)
-
+        cfg.model_name,
+        torch_dtype=dtype,
+    )
     for p in ref_model.parameters():
         p.requires_grad_(False)
     ref_model.eval()
 
-    # ── Inject LoRA into the policy model ────────────────────────────────────
+    if cfg.offload_ref_to_cpu:
+        ref_model.to("cpu")   # stays on CPU; compute_seq_log_prob moves inputs automatically
+        print("Reference model offloaded to CPU.")
+    else:
+        ref_model.to(device)
+
+    print(mem_stats(device))
+
+    # ── Inject LoRA ───────────────────────────────────────────────────────────
     n_lora = inject_lora(
         model,
         target_suffixes=list(cfg.lora_targets),
         r=cfg.lora_r,
         lora_alpha=cfg.lora_alpha,
         lora_dropout=cfg.lora_dropout,
-        skip_prefixes=["visual"],   # vision encoder stays fully frozen
+        skip_prefixes=["visual"],
     )
-    model.to(device=device, dtype=dtype) 
+    model.to(device=device, dtype=dtype)   # sync LoRA params to correct device/dtype
+
     trainable, total = count_params(model)
     print(
         f"LoRA injected into {n_lora} layers  |  "
         f"trainable: {trainable:,} / {total:,}  ({100 * trainable / total:.2f}%)"
     )
+    print(mem_stats(device))
 
     # ── Dataset ───────────────────────────────────────────────────────────────
     train_ds, val_ds = load_data(cfg)
     print(f"Train: {len(train_ds)}  |  Val: {len(val_ds)}")
 
-    # ── Optimizer + cosine-with-warmup schedule ───────────────────────────────
+    # ── Optimizer + schedule ──────────────────────────────────────────────────
     optimizer = AdamW(get_trainable_params(model), lr=cfg.lr, weight_decay=0.0)
 
     steps_per_epoch = math.ceil(len(train_ds) / cfg.grad_accum_steps)
@@ -322,22 +332,23 @@ def train(cfg: TrainConfig) -> None:
         if step < warmup_steps:
             return step / warmup_steps
         t = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * t)))   # cosine decay → 0
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * t)))
 
     scheduler = LambdaLR(optimizer, lr_lambda)
-
     Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
 
-    # ── Print header ──────────────────────────────────────────────────────────
+    # ── Header ────────────────────────────────────────────────────────────────
     print("\n" + "=" * 62)
     print("GRPO + LoRA  (raw PyTorch — no TRL / no PEFT)")
-    print(f"  model           : {cfg.model_name}")
-    print(f"  LoRA r / alpha  : {cfg.lora_r} / {cfg.lora_alpha}")
-    print(f"  G (completions) : {cfg.num_generations}")
-    print(f"  beta (KL coeff) : {cfg.beta}")
-    print(f"  lr / epochs     : {cfg.lr} / {cfg.num_epochs}")
-    print(f"  grad accum      : {cfg.grad_accum_steps}")
-    print(f"  output          : {cfg.output_dir}")
+    print(f"  model             : {cfg.model_name}")
+    print(f"  LoRA r / alpha    : {cfg.lora_r} / {cfg.lora_alpha}")
+    print(f"  G (completions)   : {cfg.num_generations}")
+    print(f"  beta (KL coeff)   : {cfg.beta}")
+    print(f"  lr / epochs       : {cfg.lr} / {cfg.num_epochs}")
+    print(f"  grad accum        : {cfg.grad_accum_steps}")
+    print(f"  ref on CPU        : {cfg.offload_ref_to_cpu}")
+    print(f"  grad checkpointing: {cfg.gradient_checkpointing}")
+    print(f"  output            : {cfg.output_dir}")
     print("=" * 62 + "\n")
 
     # ── Training ──────────────────────────────────────────────────────────────
@@ -352,7 +363,6 @@ def train(cfg: TrainConfig) -> None:
         for local_step, idx in enumerate(indices):
             example = train_ds[idx]
 
-            # --- build processor inputs ---
             try:
                 prompt_inputs = build_prompt_inputs(
                     example["prompt"], processor, device
@@ -361,7 +371,6 @@ def train(cfg: TrainConfig) -> None:
                 print(f"  [skip] input build failed (idx={idx}): {e}")
                 continue
 
-            # --- GRPO forward + compute loss ---
             try:
                 loss, metrics = grpo_step(
                     model, ref_model,
@@ -370,7 +379,9 @@ def train(cfg: TrainConfig) -> None:
                     processor, cfg, device,
                 )
             except torch.cuda.OutOfMemoryError:
-                print(f"  [OOM ] idx={idx} — clearing cache and skipping")
+                alloc = torch.cuda.memory_allocated(device) / 1024**3
+                res   = torch.cuda.memory_reserved(device)  / 1024**3
+                print(f"  [OOM ] idx={idx} — alloc={alloc:.1f}GB reserved={res:.1f}GB")
                 torch.cuda.empty_cache()
                 optimizer.zero_grad()
                 continue
@@ -379,7 +390,6 @@ def train(cfg: TrainConfig) -> None:
                 optimizer.zero_grad()
                 continue
 
-            # --- gradient accumulation ---
             (loss / cfg.grad_accum_steps).backward()
 
             for k in running:
@@ -396,21 +406,23 @@ def train(cfg: TrainConfig) -> None:
 
                 if global_step % cfg.log_steps == 0:
                     lr_now = scheduler.get_last_lr()[0]
+                    peak   = torch.cuda.max_memory_allocated(device) / 1024**3
                     print(
                         f"[ep {epoch + 1}/{cfg.num_epochs} | step {global_step:5d}]  "
                         f"loss={running['loss']:.4f}  "
                         f"pg={running['pg_loss']:.4f}  "
                         f"kl={running['kl']:.6f}  "
                         f"reward={running['reward_mean']:.4f}  "
-                        f"lr={lr_now:.2e}"
+                        f"lr={lr_now:.2e}  "
+                        f"peak_mem={peak:.1f}GB"
                     )
                     running = {k: 0.0 for k in running}
+                    torch.cuda.reset_peak_memory_stats(device)
 
                 if global_step % cfg.save_steps == 0:
                     ckpt = os.path.join(cfg.output_dir, f"lora_step{global_step:05d}.pt")
                     save_lora_weights(model, ckpt)
 
-    # ── Save final weights ────────────────────────────────────────────────────
     save_lora_weights(model, os.path.join(cfg.output_dir, "lora_final.pt"))
     processor.save_pretrained(cfg.output_dir)
     print(f"\nTraining complete. Saved to {cfg.output_dir}/")

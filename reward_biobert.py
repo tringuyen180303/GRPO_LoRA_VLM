@@ -1,79 +1,125 @@
-from sentence_transformers import SentenceTransformer, util
+"""
+reward_biobert.py
+BioBERT-based semantic similarity reward function for GRPO training.
+Computes cosine similarity between generated captions and ground truth
+using BioBERT embeddings.
+"""
+
 import torch
-from datasets import load_dataset
-from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+import torch.nn.functional as F
+from transformers import AutoTokenizer, AutoModel
 
-class CosineSimilarityCalculator:
-    def __init__(self, model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
-        self.model = SentenceTransformer(model_name)
+# Singleton to avoid reloading the model on every call
+_biobert_model = None
+_biobert_tokenizer = None
+_device = None
 
-    def calculate_similarity(self, pred: str, label: str) -> float:
-        emb_pred = self.model.encode([pred], convert_to_tensor=True)
-        emb_label = self.model.encode([label], convert_to_tensor=True)
-        return util.cos_sim(emb_pred, emb_label).item()
+BIOBERT_MODEL_NAME = "dmis-lab/biobert-large-cased-v1.1"
 
-class ModelEvaluator:
-    def __init__(self, model_name: str, dataset_name: str, split: str = "test"):
-        self.similarity_calculator = CosineSimilarityCalculator()
-        self.dataset = load_dataset(dataset_name, split=split)
 
-        self.processor = AutoProcessor.from_pretrained(model_name)
-        self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_name,
-            torch_dtype=torch.float16,
-            device_map="auto",
-        )
-        self.model.eval()
+_load_attempted = False
 
-    def evaluate(self) -> float:
-        total_similarity = 0.0
 
-        for sample in self.dataset:
-            image = sample["image"]
-            instruction = "You are an expert radiographer. Describe accurately what you see in this image."
+def _get_biobert():
+    """Lazily load BioBERT model and tokenizer (singleton)."""
+    global _biobert_model, _biobert_tokenizer, _device, _load_attempted
+    if _load_attempted:
+        return _biobert_model, _biobert_tokenizer, _device
+    _load_attempted = True
 
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image"},
-                        {"type": "text", "text": instruction},
-                    ],
-                }
-            ]
+    print(f"Loading BioBERT from {BIOBERT_MODEL_NAME} ...")
+    if torch.cuda.is_available():
+        _device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        _device = torch.device("mps")
+    else:
+        _device = torch.device("cpu")
 
-            input_ids = self.processor.apply_chat_template(
-                messages,
-                add_generation_prompt=True,
-                tokenize=True,
-                return_tensors="pt",
-            )
+    # biobert-large-cased-v1.1 has no tokenizer.json; use the slow tokenizer
+    _biobert_tokenizer = AutoTokenizer.from_pretrained(
+        BIOBERT_MODEL_NAME, use_fast=False
+    )
+    _biobert_model = AutoModel.from_pretrained(BIOBERT_MODEL_NAME).to(_device)
+    _biobert_model.eval()
+    print(f"BioBERT loaded on {_device}")
+    return _biobert_model, _biobert_tokenizer, _device
 
-            # If your processor returns a dict on your version, keep this.
-            # Otherwise, use processor(...) per the model docs.
-            if isinstance(input_ids, dict):
-                inputs = {k: v.to(self.model.device) for k, v in input_ids.items()}
-            else:
-                inputs = {"input_ids": input_ids.to(self.model.device)}
 
-            with torch.no_grad():
-                output_ids = self.model.generate(**inputs, max_new_tokens=128)
+def _encode_texts(texts: list[str]) -> torch.Tensor:
+    """Encode a list of texts into BioBERT CLS embeddings."""
+    model, tokenizer, device = _get_biobert()
+    inputs = tokenizer(
+        texts,
+        padding=True,
+        truncation=True,
+        max_length=512,
+        return_tensors="pt",
+    ).to(device)
+    with torch.no_grad():
+        outputs = model(**inputs)
+    # Use CLS token embedding (first token)
+    cls_embeddings = outputs.last_hidden_state[:, 0, :]
+    return cls_embeddings
 
-            response = self.processor.batch_decode(
-                output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True
-            )[0]
 
-            pred = response.strip()
-            label = sample["caption"]
+def biobert_reward_fn(completions, ground_truth=None):
+    """
+    Compute BioBERT cosine similarity reward for GRPO.
 
-            total_similarity += self.similarity_calculator.calculate_similarity(pred, label)
+    Args:
+        completions: list of generated strings (or list of message dicts)
+        ground_truth: list of reference caption strings
 
-        return total_similarity / len(self.dataset)
+    Returns:
+        list[float]: reward scores in [0, 1] for each completion
+    """
+    if ground_truth is None:
+        return [0.0] * len(completions)
+
+    # Extract text from completions (handle both str and message-dict formats)
+    pred_texts = []
+    for comp in completions:
+        if isinstance(comp, list):
+            # Message format: [{"role": "assistant", "content": "..."}]
+            text = comp[0].get("content", "") if comp else ""
+        elif isinstance(comp, dict):
+            text = comp.get("content", "")
+        else:
+            text = str(comp)
+        pred_texts.append(text.strip())
+
+    gt_texts = [str(gt).strip() for gt in ground_truth]
+
+    if _biobert_model is None:
+        return [0.0] * len(completions)
+
+    # Encode predictions and ground truths
+    pred_emb = _encode_texts(pred_texts)  # (N, 768)
+    gt_emb = _encode_texts(gt_texts)  # (N, 768)
+
+    # Cosine similarity per pair
+    similarities = F.cosine_similarity(pred_emb, gt_emb, dim=-1)  # (N,)
+
+    # Map from [-1, 1] to [0, 1] — clamp negatives to 0
+    rewards = torch.clamp(similarities, min=0.0).cpu().tolist()
+
+    return rewards
+
 
 if __name__ == "__main__":
-    model_name = "Qwen/Qwen2.5-VL-3B-Instruct"
-    dataset_name = "unsloth/Radiology_mini"
-
-    evaluator = ModelEvaluator(model_name=model_name, dataset_name=dataset_name)
-    avg_similarity = evaluator.evaluate()
-    print(f"Average Cosine Similarity Score: {avg_similarity:.4f}")
+    # Quick sanity check
+    preds = [
+        "Normal chest radiograph with no acute cardiopulmonary abnormality.",
+        "This is a cat sitting on a table.",
+        "Bilateral pleural effusion with cardiomegaly.",
+    ]
+    refs = [
+        "Normal chest x-ray. No acute findings.",
+        "Normal chest x-ray. No acute findings.",
+        "Large bilateral pleural effusions and enlarged cardiac silhouette.",
+    ]
+    scores = biobert_reward_fn(preds, ground_truth=refs)
+    for p, r, s in zip(preds, refs, scores):
+        print(f"Score: {s:.4f}")
+        print(f"  Pred: {p}")
+        print(f"  Ref:  {r}\n")
