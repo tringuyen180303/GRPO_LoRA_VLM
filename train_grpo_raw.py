@@ -1,6 +1,6 @@
 """
 train_grpo_raw.py
-GRPO + LoRA fine-tuning of Qwen2.5-VL-3B on Radiology_mini.
+GRPO + LoRA fine-tuning of SmolVLM-256M on Radiology_mini.
 Pure PyTorch — no TRL, no PEFT.
 
 Usage
@@ -25,7 +25,7 @@ import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+from transformers import AutoProcessor, AutoModelForImageTextToText
 from datasets import load_from_disk
 from PIL import Image
 
@@ -43,8 +43,8 @@ from reward_biobert import biobert_reward_fn
 @dataclass
 class TrainConfig:
     # Model
-    model_name: str = "Qwen/Qwen2.5-VL-3B-Instruct"
-    output_dir: str = "./xray_grpo_lora_raw"
+    model_name: str = "HuggingFaceTB/SmolVLM-256M-Instruct"
+    output_dir: str = "./xray_grpo_lora_smolvlm"
 
     # LoRA — only language-model layers; vision encoder is always frozen
     lora_r: int = 32
@@ -60,7 +60,7 @@ class TrainConfig:
     beta: float = 0.001        # KL-penalty coefficient
 
     # Training loop
-    num_epochs: int = 3
+    num_epochs: int = 15
     lr: float = 1e-5
     warmup_ratio: float = 0.1
     grad_accum_steps: int = 4  # effective mini-batch = this many prompts
@@ -154,8 +154,10 @@ def compute_seq_log_prob(
     full_mask = torch.cat([prompt_inputs["attention_mask"], torch.ones_like(completion_ids)], dim=1)
 
     kwargs: dict = {"input_ids": full_ids, "attention_mask": full_mask}
-    if "pixel_values"   in prompt_inputs:
-        kwargs["pixel_values"]   = prompt_inputs["pixel_values"]
+    if "pixel_values" in prompt_inputs:
+        kwargs["pixel_values"] = prompt_inputs["pixel_values"]
+    if "pixel_attention_mask" in prompt_inputs:
+        kwargs["pixel_attention_mask"] = prompt_inputs["pixel_attention_mask"]
     if "image_grid_thw" in prompt_inputs:
         kwargs["image_grid_thw"] = prompt_inputs["image_grid_thw"]
 
@@ -262,16 +264,26 @@ def train(cfg: TrainConfig) -> None:
     random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dtype  = torch.bfloat16 if cfg.bf16 and device.type == "cuda" else torch.float32
+    # Use MPS on Apple Silicon if available, fall back to CPU
+    # if torch.backends.mps.is_available():
+    #     device = torch.device("mps")
+    # else:
+    #     device = torch.device("cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    dtype  = torch.float32
     print(f"Device: {device}  |  dtype: {dtype}")
 
     # ── Load model and processor ──────────────────────────────────────────────
     print(f"\nLoading {cfg.model_name} ...")
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+    model = AutoModelForImageTextToText.from_pretrained(
         cfg.model_name,
         torch_dtype=dtype,
-        device_map="auto",
+        device_map=str(device),
     )
     processor = AutoProcessor.from_pretrained(cfg.model_name)
     processor.tokenizer.padding_side = "left"
@@ -293,7 +305,7 @@ def train(cfg: TrainConfig) -> None:
         r=cfg.lora_r,
         lora_alpha=cfg.lora_alpha,
         lora_dropout=cfg.lora_dropout,
-        skip_prefixes=["visual"],   # vision encoder stays fully frozen
+        skip_prefixes=["model.vision_model"],   # vision encoder stays fully frozen
     )
     trainable, total = count_params(model)
     print(
@@ -303,6 +315,7 @@ def train(cfg: TrainConfig) -> None:
 
     # ── Dataset ───────────────────────────────────────────────────────────────
     train_ds, val_ds = load_data(cfg)
+    train_ds = train_ds.select(range(min(200, len(train_ds))))
     print(f"Train: {len(train_ds)}  |  Val: {len(val_ds)}")
 
     # ── Optimizer + cosine-with-warmup schedule ───────────────────────────────
@@ -363,11 +376,14 @@ def train(cfg: TrainConfig) -> None:
                     example["ground_truth"],
                     processor, cfg, device,
                 )
-            except torch.cuda.OutOfMemoryError:
-                print(f"  [OOM ] idx={idx} — clearing cache and skipping")
-                torch.cuda.empty_cache()
-                optimizer.zero_grad()
-                continue
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    print(f"  [OOM ] idx={idx} — clearing cache and skipping")
+                    if device.type == "mps":
+                        torch.mps.empty_cache()
+                    optimizer.zero_grad()
+                    continue
+                raise
             except Exception as e:
                 print(f"  [skip] grpo_step failed (idx={idx}): {e}")
                 optimizer.zero_grad()
