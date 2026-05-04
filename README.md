@@ -6,13 +6,13 @@ Fine-tune a Vision Language Model (VLM) to generate accurate radiology image cap
 
 ## Overview
 
-| Component | Description |
-|---|---|
-| **Base model** | `HuggingFaceTB/SmolVLM-256M-Instruct` |
-| **Dataset** | `unsloth/Radiology_mini` (HuggingFace) |
-| **RL algorithm** | GRPO — samples G completions per prompt, normalizes rewards into advantages |
-| **Adapter** | LoRA on attention + MLP layers of the language model (vision encoder frozen) |
-| **Reward** | BioBERT cosine similarity (`pritamdeka/BioBERT-mnli-snli-scinli-scitail-mednli-stsb`) |
+| Component              | Description                                                                             |
+| ---------------------- | --------------------------------------------------------------------------------------- |
+| **Base model**   | `HuggingFaceTB/SmolVLM-256M-Instruct`                                                 |
+| **Dataset**      | `unsloth/Radiology_mini` (HuggingFace)                                                |
+| **RL algorithm** | GRPO — samples G completions per prompt, normalizes rewards into advantages            |
+| **Adapter**      | LoRA on attention + MLP layers of the language model (vision encoder frozen)            |
+| **Reward**       | BioBERT cosine similarity (`pritamdeka/BioBERT-mnli-snli-scinli-scitail-mednli-stsb`) |
 
 Two training backends are provided:
 
@@ -74,18 +74,19 @@ python train_grpo_raw.py
 
 Key hyperparameters (edit `TrainConfig` in `train_grpo_raw.py`):
 
-| Parameter | Default | Description |
-|---|---|---|
-| `model_name` | `HuggingFaceTB/SmolVLM-256M-Instruct` | Base VLM |
-| `lora_r` | `32` | LoRA rank |
-| `lora_alpha` | `32.0` | LoRA scaling |
-| `num_generations` | `4` | Completions sampled per prompt (GRPO group size) |
-| `beta` | `0.001` | KL penalty coefficient |
-| `num_epochs` | `15` | Training epochs |
-| `lr` | `1e-5` | Learning rate |
-| `max_new_tokens` | `128` | Max caption length |
+| Parameter           | Default                                 | Description                                      |
+| ------------------- | --------------------------------------- | ------------------------------------------------ |
+| `model_name`      | `HuggingFaceTB/SmolVLM-256M-Instruct` | Base VLM                                         |
+| `lora_r`          | `32`                                  | LoRA rank                                        |
+| `lora_alpha`      | `32.0`                                | LoRA scaling                                     |
+| `num_generations` | `4`                                   | Completions sampled per prompt (GRPO group size) |
+| `beta`            | `0.001`                               | KL penalty coefficient                           |
+| `num_epochs`      | `15`                                  | Training epochs                                  |
+| `lr`              | `1e-5`                                | Learning rate                                    |
+| `max_new_tokens`  | `128`                                 | Max caption length                               |
 
 Checkpoints are saved to `xray_grpo_lora_smolvlm/`:
+
 - `lora_step{N}.pt` every 50 steps
 - `lora_final.pt` at the end of training
 
@@ -117,6 +118,44 @@ For each training prompt (image + instruction):
 ```
 L = −mean(A_i · log π_θ(y_i | x)) + β · mean(log π_θ − log π_ref)
 ```
+
+---
+
+## Example Images
+
+### Training Samples
+
+| Image                                                                           | Caption                                                                                                                                       |
+| ------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `<img src="image_examples/train/ROCOv2_2023_train_054311.png" height="200"/>` | Panoramic radiography shows an osteolytic lesion in the right posterior maxilla with resorption of the floor of the maxillary sinus (arrows). |
+| `<img src="image_examples/train/ROCOv2_2023_train_005812.png" height="200"/>` | Pericarditis.                                                                                                                                 |
+| `<img src="image_examples/train/ROCOv2_2023_train_059707.png" height="200"/>` | One year follow up CT scan showing the catheter in place and the normal ventricular system.                                                   |
+
+### Test Samples — Best vs Worst Similarity (after training on only 100 images)
+
+|                        | Best Case (sim. = 0.74)                                                                                 | Worst Case (sim. = 0.27)                                                      |
+| ---------------------- | ------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| **Image**        | `<img src="image_examples/test/ROCOv2_2023_test_004479.png" height="200"/>`                           | `<img src="image_examples/test/ROCOv2_2023_test_009162.png" height="200"/>` |
+| **Predicted**    | Axial MRI of the body with two blue arrows pointing right.                                              | Lateral chest X-ray showing ribs, spine, lungs, and heart.                    |
+| **Ground Truth** | Sagittal MRI of the cervical spine showing a lesion within C2 involving anterior and posterior columns. | Terminal ileum 6.5 cm; cecum and colon 22 cm long, 3.5–5.9 cm in diameter.   |
+
+## Example Images
+
+### Training Samples
+
+| Image                                                      | Caption                                                                                                                                       |
+| ---------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| ![train1](image_examples/train/ROCOv2_2023_train_054311.png) | Panoramic radiography shows an osteolytic lesion in the right posterior maxilla with resorption of the floor of the maxillary sinus (arrows). |
+| ![train2](image_examples/train/ROCOv2_2023_train_005812.png) | Pericarditis.                                                                                                                                 |
+| ![train3](image_examples/train/ROCOv2_2023_train_059707.png) | One year follow up CT scan showing the catheter in place and the normal ventricular system.                                                   |
+
+### Test Samples — Best vs Worst Similarity (after training on only 100 images)
+
+|                        | Best Case (sim. = 0.74)                                                                                 | Worst Case (sim. = 0.27)                                                    |
+| ---------------------- | ------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| **Image**        | ![best](image_examples/test/ROCOv2_2023_test_004479.png)                                                  | ![worst](image_examples/test/ROCOv2_2023_test_009162.png)                     |
+| **Predicted**    | Axial MRI of the body with two blue arrows pointing right.                                              | Lateral chest X-ray showing ribs, spine, lungs, and heart.                  |
+| **Ground Truth** | Sagittal MRI of the cervical spine showing a lesion within C2 involving anterior and posterior columns. | Terminal ileum 6.5 cm; cecum and colon 22 cm long, 3.5–5.9 cm in diameter. |
 
 ---
 
